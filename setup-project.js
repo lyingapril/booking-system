@@ -1,0 +1,128 @@
+const fs = require('fs');
+const path = require('path');
+const childProcess = require('child_process');
+const execSync = childProcess.execSync;
+
+// 项目结构定义
+const projectStructure = {
+  "backend": {
+    "config": {
+      "db.js": "const { Sequelize } = require('sequelize');\nconst path = require('path');\n\n// 数据库文件路径\nconst dbPath = path.join('database', 'booking.db');\n\n// 初始化数据库连接\nconst sequelize = new Sequelize(`sqlite:${dbPath}`, {\n  logging: false, // 关闭SQL日志（开发时可改为console.log开启）\n});\n\nmodule.exports = sequelize;\n"
+    },
+    "models": {
+      "Booking.js": "const { Model, DataTypes } = require('sequelize');\nconst sequelize = require('../config/db');\n\nclass Booking extends Model {}\n\n// 定义模型结构，暂时不设置关联\nBooking.init({\n  userName: {\n    type: DataTypes.STRING,\n    allowNull: false\n  },\n  userPhone: {\n    type: DataTypes.STRING,\n    allowNull: false\n  },\n  serviceId: {\n    type: DataTypes.INTEGER,\n    allowNull: false,\n    references: {\n      // 这里只定义引用关系，不直接加载模型\n      model: 'Services', // 对应数据库表名（通常是模型名的复数形式）\n      key: 'id'\n    }\n  },\n  startTime: {\n    type: DataTypes.DATE,\n    allowNull: false\n  },\n  endTime: {\n    type: DataTypes.DATE,\n    allowNull: false\n  },\n  status: {\n    type: DataTypes.STRING,\n    defaultValue: 'pending', // pending/confirmed/canceled\n    validate: {\n      isIn: [['pending', 'confirmed', 'canceled']]\n    }\n  },\n  notes: {\n    type: DataTypes.TEXT,\n    comment: '用户备注'\n  }\n}, { sequelize });\n\n// 使用延迟关联，避免循环引用问题\n// 在所有模型都加载完成后再建立关联\nBooking.associate = (models) => {\n  Booking.belongsTo(models.Service, { \n    foreignKey: 'serviceId',\n    as: 'Service' // 别名，便于查询时使用\n  });\n};\n\nmodule.exports = Booking;",
+      "index.js": "const Sequelize = require('sequelize');\r\nconst sequelizeInstance = require('../config/db'); // 导入Sequelize实例\r\nconst Booking = require('./Booking');\r\nconst Service = require('./Service');\r\n\r\n// 收集所有模型\r\nconst models = {\r\n  Booking,\r\n  Service\r\n};\r\n\r\n// 初始化所有模型的关联关系\r\nObject.values(models).forEach(model => {\r\n  if (model.associate) {\r\n    model.associate(models);\r\n  }\r\n});\r\n\r\n// 导出模型和数据库连接实例\r\nmodule.exports = {\r\n  Sequelize,          // 导出Sequelize构造函数\r\n  sequelize: sequelizeInstance, // 导出实例（使用明确的变量名避免混淆）\r\n  ...models\r\n};\r\n",
+      "Service.js": "const { Model, DataTypes } = require('sequelize');\nconst sequelize = require('../config/db');\n\nclass Service extends Model {}\n\nService.init({\n  name: {\n    type: DataTypes.STRING,\n    allowNull: false,\n    comment: '服务名称'\n  },\n  description: {\n    type: DataTypes.TEXT,\n    comment: '服务描述'\n  },\n  duration: {\n    type: DataTypes.INTEGER,\n    defaultValue: 30,\n    comment: '服务时长（分钟）'\n  },\n  price: {\n    type: DataTypes.FLOAT,\n    defaultValue: 0,\n    comment: '服务价格（元）'\n  }\n}, { sequelize });\n\n// 添加关联配置\nService.associate = (models) => {\n  Service.hasMany(models.Booking, {\n    foreignKey: 'serviceId',\n    as: 'Bookings'\n  });\n};\n\nmodule.exports = Service;"
+    },
+    "package.json": "{\n  \"name\": \"booking-system-backend\",\n  \"version\": \"1.0.0\",\n  \"description\": \"预约系统后端服务\",\n  \"main\": \"server.js\",\n  \"scripts\": {\n    \"start\": \"node server.js\",\n    \"dev\": \"nodemon server.js\"\n  },\n  \"dependencies\": {\n    \"express\": \"^4.18.2\",\n    \"sequelize\": \"^6.32.1\",\n    \"sqlite3\": \"^5.1.6\",\n    \"cors\": \"^2.8.5\"\n  },\n  \"devDependencies\": {\n    \"nodemon\": \"^3.0.1\"\n  }\n}",
+    "routes": {
+      "bookingRoutes.js": "const express = require('express');\nconst router = express.Router();\nconst { Booking, Service } = require('../models');\nconst { Op } = require('sequelize');\nconst { sendNotification } = require('../utils/notification');\n\n// 1. 获取可预约时段\nrouter.get('/available-times', async (req, res) => {\n  try {\n    const { service_id, date } = req.query;\n    if (!service_id || !date) {\n      return res.status(400).json({ error: '请提供服务ID和日期' });\n    }\n\n    // 验证服务是否存在\n    const service = await Service.findByPk(service_id);\n    if (!service) {\n      return res.status(404).json({ error: '服务不存在' });\n    }\n\n    // 解析日期\n    const [year, month, day] = date.split('-').map(Number);\n    if (!year || !month || !day) {\n      return res.status(400).json({ error: '日期格式错误，请使用YYYY-MM-DD' });\n    }\n\n    // 服务时间范围（9:00-18:00）\n    const startHour = 9;\n    const endHour = 18;\n    const duration = service.duration; // 从服务获取时长\n    const available = [];\n\n    // 生成时间段\n    let current = new Date(year, month - 1, day, startHour);\n    const endOfDay = new Date(year, month - 1, day, endHour);\n\n    while (current < endOfDay) {\n      const nextTime = new Date(current.getTime() + duration * 60000);\n      \n      // 检查是否超过当天结束时间\n      if (nextTime > endOfDay) break;\n\n      // 检查时间冲突\n      const conflict = await Booking.findOne({\n        where: {\n          serviceId: service_id,\n          status: { [Op.ne]: 'canceled' },\n          startTime: { [Op.lt]: nextTime },\n          endTime: { [Op.gt]: current }\n        }\n      });\n\n      if (!conflict) {\n        available.push({\n          start: current.toTimeString().slice(0, 5), // 格式化为HH:MM\n          end: nextTime.toTimeString().slice(0, 5)\n        });\n      }\n\n      current = nextTime;\n    }\n\n    res.json(available);\n  } catch (err) {\n    console.error('获取可预约时段失败:', err);\n    res.status(500).json({ error: '服务器错误' });\n  }\n});\n\n// 2. 创建预约\nrouter.post('/', async (req, res) => {\n  try {\n    const { serviceId, date, startTime, name, phone, notes } = req.body;\n    \n    // 验证参数\n    if (!serviceId || !date || !startTime || !name || !phone) {\n      return res.status(400).json({ error: '请填写完整信息' });\n    }\n\n    // 解析时间\n    const [year, month, day] = date.split('-').map(Number);\n    const [hours, mins] = startTime.split(':').map(Number);\n    const start = new Date(year, month - 1, day, hours, mins);\n    \n    // 获取服务信息\n    const service = await Service.findByPk(serviceId);\n    if (!service) {\n      return res.status(404).json({ error: '服务不存在' });\n    }\n\n    // 计算结束时间\n    const end = new Date(start.getTime() + service.duration * 60000);\n\n    // 检查时间是否在服务时段内（9:00-18:00）\n    if (start.getHours() < 9 || end.getHours() > 18) {\n      return res.status(400).json({ error: '超出服务时间（9:00-18:00）' });\n    }\n\n    // 检查时间冲突\n    const conflict = await Booking.findOne({\n      where: {\n        serviceId,\n        status: { [Op.ne]: 'canceled' },\n        startTime: { [Op.lt]: end },\n        endTime: { [Op.gt]: start }\n      }\n    });\n\n    if (conflict) {\n      return res.status(400).json({ error: '该时段已被预约，请选择其他时间' });\n    }\n\n    // 创建预约记录\n    const booking = await Booking.create({\n      userName: name,\n      userPhone: phone,\n      serviceId,\n      startTime: start,\n      endTime: end,\n      notes,\n      status: 'confirmed' // 直接确认预约\n    });\n\n    // 发送通知\n    sendNotification({\n      phone,\n      message: `您已成功预约【${service.name}】，时间：${date} ${startTime}-${end.toTimeString().slice(0,5)}，预约ID：${booking.id}`\n    });\n\n    res.status(201).json({ \n      success: true, \n      bookingId: booking.id,\n      message: '预约成功'\n    });\n  } catch (err) {\n    console.error('创建预约失败:', err);\n    res.status(500).json({ error: '服务器错误' });\n  }\n});\n\n// 3. 查询个人预约记录\nrouter.get('/my-bookings', async (req, res) => {\n  try {\n    const { phone } = req.query;\n    if (!phone) {\n      return res.status(400).json({ error: '请提供手机号' });\n    }\n\n    const bookings = await Booking.findAll({\n      where: { userPhone: phone },\n      include: [{ model: Service, as: 'Service', attributes: ['name', 'description'] }],\n      order: [['startTime', 'DESC']]\n    });\n\n    res.json(bookings);\n  } catch (err) {\n    console.error('查询预约记录失败:', err);\n    res.status(500).json({ error: '服务器错误' });\n  }\n});\n\n// 4. 取消预约\nrouter.post('/cancel', async (req, res) => {\n  try {\n    const { bookingId, phone } = req.body;\n    if (!bookingId || !phone) {\n      return res.status(400).json({ error: '请提供预约ID和手机号' });\n    }\n\n    const booking = await Booking.findOne({\n      where: { id: bookingId, userPhone: phone }\n    });\n\n    if (!booking) {\n      return res.status(404).json({ error: '预约记录不存在' });\n    }\n\n    // 检查是否可以取消（提前2小时）\n    const now = new Date();\n    const cancelDeadline = new Date(booking.startTime.getTime() - 2 * 60 * 60000);\n    if (now > cancelDeadline) {\n      return res.status(400).json({ error: '需提前2小时取消预约' });\n    }\n\n    // 更新状态\n    booking.status = 'canceled';\n    await booking.save();\n\n    res.json({ success: true, message: '预约已取消' });\n  } catch (err) {\n    console.error('取消预约失败:', err);\n    res.status(500).json({ error: '服务器错误' });\n  }\n});\n\nmodule.exports = router;",
+      "serviceRoutes.js": "const express = require('express');\nconst router = express.Router();\nconst Service = require('../models/Service');\n\n// 获取所有服务\nrouter.get('/', async (req, res) => {\n  try {\n    const services = await Service.findAll();\n    res.json(services);\n  } catch (err) {\n    console.error('获取服务失败:', err);\n    res.status(500).json({ error: '服务器错误' });\n  }\n});\n\n// 添加服务\nrouter.post('/', async (req, res) => {\n  try {\n    const service = await Service.create(req.body);\n    res.status(201).json(service);\n  } catch (err) {\n    console.error('创建服务失败:', err);\n    res.status(500).json({ error: '服务器错误' });\n  }\n});\n\nmodule.exports = router;"
+    },
+    "seed-services.js": "const sequelize = require('./config/db');\r\nconst Service = require('./models/Service');\r\n\r\n// 示例服务数据\r\nconst sampleServices = [\r\n  {\r\n    name: \"阿童木基础咨询\",\r\n    description: \"30分钟的基础咨询服务，解答常见问题\",\r\n    duration: 30,\r\n    price: 99.00\r\n  },\r\n  {\r\n    name: \"阿童木深度分析\",\r\n    description: \"60分钟的深度分析服务，提供详细解决方案\",\r\n    duration: 60,\r\n    price: 199.00\r\n  },\r\n  {\r\n    name: \"阿童木快速诊断\",\r\n    description: \"15分钟的快速问题诊断\",\r\n    duration: 15,\r\n    price: 49.00\r\n  },\r\n  {\r\n    name: \"阿童木专家会诊\",\r\n    description: \"90分钟的多位专家会诊服务\",\r\n    duration: 90,\r\n    price: 399.00\r\n  },\r\n  {\r\n    name: \"阿童木随访服务\",\r\n    description: \"咨询后的30分钟随访，跟进解决情况\",\r\n    duration: 30,\r\n    price: 69.00\r\n  }\r\n];\r\n\r\n// 插入示例数据\r\nasync function seedServices() {\r\n  try {\r\n    // 连接数据库\r\n    await sequelize.sync();\r\n    \r\n    // 先清空现有服务数据（可选）\r\n    await Service.destroy({ where: {} });\r\n    \r\n    // 插入新数据\r\n    await Service.bulkCreate(sampleServices);\r\n    \r\n    console.log(`成功添加了 ${sampleServices.length} 条服务示例数据`);\r\n    process.exit(0);\r\n  } catch (error) {\r\n    console.error('添加示例数据失败:', error);\r\n    process.exit(1);\r\n  }\r\n}\r\n\r\n// 执行脚本\r\nseedServices();\r\n",
+    "server.js": "const express = require('express');\nconst cors = require('cors');\n// 从模型索引文件导入sequelize实例（注意变量名）\nconst { sequelize } = require('./models'); \nconst bookingRoutes = require('./routes/bookingRoutes');\nconst serviceRoutes = require('./routes/serviceRoutes');\n\n// 初始化Express\nconst app = express();\nconst PORT = process.env.PORT || 3000;\n\n// 中间件\napp.use(cors()); // 解决跨域问题\napp.use(express.json());\n\n// 路由\napp.use('/api/bookings', bookingRoutes);\napp.use('/api/services', serviceRoutes);\n\n// 测试接口\napp.get('/', (req, res) => {\n  res.send('预约系统API运行中');\n});\n\n// 初始化数据库并启动服务\nconst startServer = async () => {\n  try {\n    // 现在sequelize是正确的实例，拥有sync方法\n    await sequelize.sync({ force: false }); // 同步模型到数据库（不删除现有数据）\n    console.log('数据库连接成功，模型关联已初始化');\n    app.listen(PORT, () => {\n      console.log(`服务器运行在 http://localhost:${PORT}`);\n    });\n  } catch (err) {\n    console.error('数据库连接失败:', err);\n  }\n};\n\nstartServer();\n",
+    "utils": {
+      "notification.js": "// 通知工具\nconst sendNotification = async ({ phone, message }) => {\n  try {\n    // 开发环境下仅打印日志\n    console.log(`发送通知给 ${phone}: ${message}`);\n    \n    // 生产环境对接短信API示例：\n    // const SMSClient = require('@alicloud/sms-sdk');\n    // const client = new SMSClient({ accessKeyId: 'yourKey', secretAccessKey: 'yourSecret' });\n    // await client.sendSMS({\n    //   PhoneNumbers: phone,\n    //   SignName: '你的签名',\n    //   TemplateCode: '你的模板ID',\n    //   TemplateParam: JSON.stringify({ message })\n    // });\n  } catch (err) {\n    console.error('发送通知失败:', err);\n    // 通知失败不影响主流程，仅记录日志\n  }\n};\n\nmodule.exports = { sendNotification };"
+    }
+  },
+  "frontend": {
+    "package.json": "{\n  \"name\": \"booking-system-frontend\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"serve\": \"vue-cli-service serve\",\n    \"build\": \"vue-cli-service build\"\n  },\n  \"dependencies\": {\n    \"axios\": \"^1.4.0\",\n    \"element-plus\": \"^2.3.9\",\n    \"vue\": \"^3.3.4\",\n    \"vue-router\": \"^4.2.4\"\n  },\n  \"devDependencies\": {\n    \"@vue/cli-service\": \"~5.0.0\"\n  }\n}",
+    "src": {
+      "App.vue": "<template>\n  <div id=\"app\">\n    <!-- 导航栏 -->\n    <nav class=\"navbar\">\n      <div class=\"container\">\n        <h1>时间预约系统</h1>\n        <div class=\"nav-links\">\n          <router-link to=\"/\">首页预约</router-link>\n          <router-link to=\"/my-bookings\">我的预约</router-link>\n        </div>\n      </div>\n    </nav>\n    \n    <!-- 主要内容区域 -->\n    <div class=\"container main-content\">\n      <router-view />\n    </div>\n    \n    <!-- 页脚 -->\n    <footer>\n      <div class=\"container\">\n        <p>&copy; {{ new Date().getFullYear() }} 时间预约系统 - 版权所有</p>\n      </div>\n    </footer>\n  </div>\n</template>\n\n<script setup>\n// 根组件不需要额外逻辑，主要提供布局和路由出口\n</script>\n\n<style>\n/* 基础样式 */\n* {\n  margin: 0;\n  padding: 0;\n  box-sizing: border-box;\n  font-family: 'Arial', sans-serif;\n}\n\n.container {\n  width: 100%;\n  max-width: 1200px;\n  margin: 0 auto;\n  padding: 0 20px;\n}\n\n/* 导航栏样式 */\n.navbar {\n  background-color: #409eff;\n  color: white;\n  padding: 15px 0;\n  box-shadow: 0 2px 4px rgba(0,0,0,0.1);\n}\n\n.navbar .container {\n  display: flex;\n  justify-content: space-between;\n  align-items: center;\n}\n\n.nav-links {\n  display: flex;\n  gap: 20px;\n}\n\n.nav-links a {\n  color: white;\n  text-decoration: none;\n  padding: 5px 10px;\n  border-radius: 4px;\n  transition: background-color 0.3s;\n}\n\n.nav-links a:hover,\n.nav-links a.router-link-exact-active {\n  background-color: rgba(255,255,255,0.2);\n}\n\n/* 主要内容区域 */\n.main-content {\n  min-height: calc(100vh - 130px);\n  padding: 30px 0;\n}\n\n/* 页脚样式 */\nfooter {\n  background-color: #f5f5f5;\n  padding: 20px 0;\n  text-align: center;\n  color: #666;\n}\n</style>",
+      "axios.js": "import axios from 'axios';\n\nconst api = axios.create({\n  baseURL: 'http://localhost:3000/api', // 后端API地址\n  timeout: 5000\n});\n\nexport default api;",
+      "components": {
+        "BookingForm.vue": "<template>\n  <div class=\"booking-container\">\n    <h2>预约服务</h2>\n    <el-select v-model=\"selectedService\" placeholder=\"选择服务\" @change=\"loadAvailableTimes\">\n      <el-option v-for=\"service in services\" :key=\"service.id\" :label=\"service.name\" :value=\"service.id\"></el-option>\n    </el-select>\n\n    <el-date-picker\n      v-model=\"selectedDate\"\n      type=\"date\"\n      placeholder=\"选择日期\"\n      @change=\"loadAvailableTimes\"\n      :disabled-date=\"disablePastDates\"\n    ></el-date-picker>\n\n    <div class=\"time-slots\">\n      <el-button \n        v-for=\"time in availableTimes\" \n        :key=\"time.start\"\n        @click=\"selectTime(time)\"\n        :disabled=\"time.selected\"\n        :class=\"{ 'selected': time.selected }\"\n      >\n        {{ time.start }} - {{ time.end }}\n      </el-button>\n    </div>\n\n    <el-form v-if=\"selectedTime\" @submit.prevent=\"submitBooking\">\n      <el-input v-model=\"userName\" placeholder=\"姓名\"></el-input>\n      <el-input v-model=\"userPhone\" placeholder=\"手机号\"></el-input>\n      <el-input type=\"textarea\" v-model=\"notes\" placeholder=\"备注信息（可选）\"></el-input>\n      <el-button type=\"primary\" native-type=\"submit\">确认预约</el-button>\n    </el-form>\n  </div>\n</template>\n\n<script setup>\nimport { ref, onMounted } from 'vue';\nimport api from '../axios';\n\nconst services = ref([]);\nconst selectedService = ref('');\nconst selectedDate = ref(null);\nconst availableTimes = ref([]);\nconst selectedTime = ref(null);\nconst userName = ref('');\nconst userPhone = ref('');\nconst notes = ref('');\n\n// 禁用过去的日期（只能选择今天及以后的日期）\nconst disablePastDates = (time) => {\n  // 获取今天的凌晨时间（00:00:00）\n  const today = new Date();\n  today.setHours(0, 0, 0, 0);\n  \n  // 如果选择的日期在今天之前，则禁用\n  return time < today;\n};\n\n// 格式化Date对象为YYYY-MM-DD字符串\nconst formatDate = (date) => {\n  if (!date) return '';\n  const year = date.getFullYear();\n  const month = String(date.getMonth() + 1).padStart(2, '0');\n  const day = String(date.getDate()).padStart(2, '0');\n  return `${year}-${month}-${day}`;\n};\n\n// 加载服务列表\nonMounted(async () => {\n  try {\n    const res = await api.get('/services');\n    services.value = res.data;\n  } catch (err) {\n    console.error('加载服务失败', err);\n  }\n});\n\n// 加载可选时段\nconst loadAvailableTimes = async () => {\n  if (!selectedService.value || !selectedDate.value) return;\n  \n  const dateStr = formatDate(selectedDate.value);\n  \n  try {\n    const res = await api.get('/bookings/available-times', {\n      params: { service_id: selectedService.value, date: dateStr }\n    });\n    availableTimes.value = res.data.map(time => ({ ...time, selected: false }));\n    selectedTime.value = null;\n  } catch (err) {\n    alert(err.response?.data?.error || '加载时段失败');\n  }\n};\n\n// 选择时段\nconst selectTime = (time) => {\n  availableTimes.value.forEach(t => t.selected = false);\n  time.selected = true;\n  selectedTime.value = time;\n};\n\n// 提交预约\nconst submitBooking = async () => {\n  if (!userName.value || !userPhone.value) {\n    alert('请填写姓名和手机号');\n    return;\n  }\n\n  try {\n    const res = await api.post('/bookings', {\n      serviceId: selectedService.value,\n      date: formatDate(selectedDate.value),\n      startTime: selectedTime.value.start,\n      name: userName.value,\n      phone: userPhone.value,\n      notes: notes.value\n    });\n    alert('预约成功！预约ID：' + res.data.bookingId);\n    // 重置表单\n    selectedTime.value = null;\n    userName.value = '';\n    userPhone.value = '';\n    notes.value = '';\n    loadAvailableTimes();\n  } catch (err) {\n    alert(err.response?.data?.error || '预约失败，请重试');\n  }\n};\n</script>\n\n<style scoped>\n.booking-container {\n  max-width: 800px;\n  margin: 20px auto;\n  padding: 20px;\n}\n\n.time-slots {\n  margin: 20px 0;\n  display: flex;\n  flex-wrap: wrap;\n  gap: 10px;\n}\n\n.selected {\n  background-color: #409eff;\n  color: white;\n}\n</style>\n",
+        "MyBookings.vue": "<template>\n  <div class=\"my-bookings\">\n    <h2>我的预约记录</h2>\n    <el-input \n      v-model=\"phone\" \n      placeholder=\"请输入预约时的手机号\" \n      style=\"width: 300px; margin-bottom: 20px;\"\n    ></el-input>\n    <el-button type=\"primary\" @click=\"fetchBookings\">查询</el-button>\n\n    <el-table \n      v-if=\"bookings.length > 0\" \n      :data=\"bookings\" \n      border \n      style=\"width: 100%; margin-top: 20px;\"\n    >\n      <el-table-column prop=\"id\" label=\"预约ID\" width=\"80\"></el-table-column>\n      <el-table-column \n        label=\"服务名称\" \n        width=\"150\"\n      >\n        <template #default=\"scope\">{{ scope.row.Service.name }}</template>\n      </el-table-column>\n      <el-table-column \n        label=\"预约时间\" \n        width=\"200\"\n      >\n        <template #default=\"scope\">\n          {{ formatDate(scope.row.startTime) }}\n          <br>\n          {{ formatTime(scope.row.startTime) }} - {{ formatTime(scope.row.endTime) }}\n        </template>\n      </el-table-column>\n      <el-table-column \n        prop=\"status\" \n        label=\"状态\" \n        width=\"100\"\n        :formatter=\"statusFormatter\"\n      ></el-table-column>\n      <el-table-column \n        label=\"操作\" \n        width=\"120\"\n      >\n        <template #default=\"scope\">\n          <el-button \n            type=\"danger\" \n            size=\"small\" \n            @click=\"cancelBooking(scope.row.id)\"\n            :disabled=\"!canCancel(scope.row)\"\n          >\n            取消预约\n          </el-button>\n        </template>\n      </el-table-column>\n    </el-table>\n\n    <div v-else-if=\"hasSearched\" class=\"no-record\">\n      暂无预约记录\n    </div>\n  </div>\n</template>\n\n<script setup>\nimport { ref } from 'vue';\nimport api from '../axios';\n\nconst phone = ref('');\nconst bookings = ref([]);\nconst hasSearched = ref(false);\n\n// 查询预约记录\nconst fetchBookings = async () => {\n  if (!phone.value) {\n    alert('请输入手机号');\n    return;\n  }\n  \n  try {\n    const res = await api.get('/bookings/my-bookings', {\n      params: { phone: phone.value }\n    });\n    bookings.value = res.data;\n    hasSearched.value = true;\n  } catch (err) {\n    alert(err.response?.data?.error || '查询失败');\n  }\n};\n\n// 取消预约\nconst cancelBooking = async (bookingId) => {\n  if (!confirm('确定要取消预约吗？')) return;\n  \n  try {\n    await api.post('/bookings/cancel', {\n      bookingId,\n      phone: phone.value\n    });\n    alert('取消成功');\n    fetchBookings(); // 刷新列表\n  } catch (err) {\n    alert(err.response?.data?.error || '取消失败');\n  }\n};\n\n// 格式化日期\nconst formatDate = (dateStr) => {\n  const date = new Date(dateStr);\n  return date.toLocaleDateString('zh-CN');\n};\n\n// 格式化时间\nconst formatTime = (dateStr) => {\n  const date = new Date(dateStr);\n  return date.toTimeString().slice(0, 5);\n};\n\n// 状态格式化\nconst statusFormatter = (row) => {\n  const statusMap = {\n    'pending': '待确认',\n    'confirmed': '已确认',\n    'canceled': '已取消'\n  };\n  return statusMap[row.status] || row.status;\n};\n\n// 判断是否可以取消\nconst canCancel = (row) => {\n  if (row.status !== 'confirmed') return false;\n  \n  const now = new Date();\n  const startTime = new Date(row.startTime);\n  const cancelDeadline = new Date(startTime.getTime() - 2 * 60 * 60000); // 提前2小时\n  \n  return now < cancelDeadline;\n};\n</script>\n\n<style scoped>\n.my-bookings {\n  max-width: 1000px;\n  margin: 20px auto;\n  padding: 20px;\n}\n\n.no-record {\n  text-align: center;\n  padding: 50px;\n  color: #666;\n}\n</style>"
+      },
+      "main.js": "import { createApp } from 'vue';\nimport App from './App.vue';\nimport router from './router';\nimport ElementPlus from 'element-plus';\nimport 'element-plus/dist/index.css';\n\ncreateApp(App)\n  .use(router)\n  .use(ElementPlus)\n  .mount('#app');",
+      "router": {
+        "index.js": "import { createRouter, createWebHistory } from 'vue-router';\nimport BookingForm from '../components/BookingForm.vue';\nimport MyBookings from '../components/MyBookings.vue';\n\nconst routes = [\n  { path: '/', name: 'Booking', component: BookingForm },\n  { path: '/my-bookings', name: 'MyBookings', component: MyBookings }\n];\n\nconst router = createRouter({\n  history: createWebHistory(),\n  routes\n});\n\nexport default router;"
+      },
+      "views": {}
+    }
+  },
+  "README.md": "# 时间预约系统\n\n一个基于Node.js + Express + Vue的时间预约系统。\n\n## 功能特点\n\n- 服务预约功能\n- 预约记录查询\n- 预约取消功能\n- 服务管理\n\n## 安装与启动\n\n### 自动安装（推荐）\n运行 setup-project.js 脚本会自动创建项目并安装依赖\n\n### 手动启动\n\n```bash\n# 启动后端\ncd backend\nnpm run dev\n\n# 启动前端\ncd ../frontend\nnpm run serve\n```\n\n## 技术栈\n\n- 后端: Node.js, Express, Sequelize, SQLite\n- 前端: Vue 3, Element Plus, Axios"
+};
+
+// 创建目录和文件的函数
+function createStructure(basePath, structure) {
+  for (const [name, content] of Object.entries(structure)) {
+    const fullPath = path.join(basePath, name);
+    
+    if (typeof content === 'object' && content !== null) {
+      // 创建目录
+      if (!fs.existsSync(fullPath)) {
+        fs.mkdirSync(fullPath, { recursive: true });
+        console.log(`创建目录: ${fullPath}`);
+      }
+      createStructure(fullPath, content);
+    } else {
+      // 创建文件
+      fs.writeFileSync(fullPath, content);
+      console.log(`创建文件: ${fullPath}`);
+    }
+  }
+}
+
+// 执行命令并显示进度
+function runCommand(command, cwd, description) {
+  try {
+    console.log(`开始${description}...`);
+    execSync(command, { cwd, stdio: 'inherit' });
+    console.log(`${description}完成`);
+  } catch (error) {
+    console.error(`${description}失败:`, error.message);
+    console.error('你可以尝试手动安装依赖：');
+    console.error(`1. 后端：cd backend && npm install`);
+    console.error(`2. 前端：cd frontend && npm install`);
+    process.exit(1);
+  }
+}
+
+// 主函数
+async function main() {
+  try {
+    console.log('开始创建项目结构...');
+    createStructure(process.cwd(), projectStructure);
+    console.log('项目结构创建完成！');
+
+    // 如果存在后端目录，安装依赖
+    if (fs.existsSync(path.join(process.cwd(), 'backend'))) {
+      runCommand(
+        'npm install', 
+        path.join(process.cwd(), 'backend'), 
+        '安装后端依赖'
+      );
+    }
+
+    // 如果存在前端目录，安装依赖
+    if (fs.existsSync(path.join(process.cwd(), 'frontend'))) {
+      runCommand(
+        'npm install', 
+        path.join(process.cwd(), 'frontend'), 
+        '安装前端依赖'
+      );
+    }
+
+    // 如果存在种子脚本，执行它
+    const seedScript = path.join(process.cwd(), 'backend', 'seed-services.js');
+    if (fs.existsSync(seedScript)) {
+      runCommand(
+        'node seed-services.js', 
+        path.join(process.cwd(), 'backend'), 
+        '初始化服务示例数据'
+      );
+    }
+
+    console.log('\n所有操作完成！');
+    console.log('可以通过以下命令启动服务：');
+    console.log('1. 启动后端服务: cd backend && npm run dev');
+    console.log('2. 启动前端服务: 打开新终端，cd frontend && npm run serve');
+  } catch (err) {
+    console.error('创建项目时出错:', err.message);
+    process.exit(1);
+  }
+}
+
+// 执行主函数
+main();
